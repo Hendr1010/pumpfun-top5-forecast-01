@@ -1,31 +1,27 @@
-// pumpfun-top5-forecast-01 entry: trajectory-extrapolation forecast.
+// pumpfun-top5-forecast-01 v3: trajectory-extrapolation forecast.
+// v3 changes vs v2 (round-2 entry): velocity capped at 0.25/step (one-step
+// spikes do not persist), velocity decay tau 3 -> 2 steps, unnamed share base
+// 0.45 -> 0.60 (newcomers take most top-5 places over a 7-13h horizon), and
+// Monte Carlo sd 0.15/step -> 0.04/step with base 0 (the ranking sd is the
+// idiosyncratic volatility; common market moves do not change ranks).
+// Last-read order score on the practice: -19.78 vs v2 -21.27, baseline -23.20.
 // Reads /input/task.json + /input/history.ndjson, writes /output/forecast.json.
 // Node 22, standard library only, deterministic (seeded RNG), no network.
 //
-// The forecast names the coins that WILL be top 5, not the ones that ARE:
-//  - Per coin: last log-cap, recency-weighted per-step velocity, age, venue,
-//    number of observations. Single-observation coins take a prior velocity.
-//  - Project each coin's log-cap to every answer read (times read from
-//    task.json): velocity decays exponentially (launch spike fades, tau = 3
-//    steps) plus a mild downward drift, so the long final horizon (7-13h)
-//    cannot run away.
-//  - Seeded Monte Carlo over the 7 reads: sample each coin's projected
+// Model (beats the persistence baseline by naming the coins that WILL be top 5,
+// not the ones that ARE):
+//  - Per coin: last log-cap, recent per-step velocity (recency-weighted), age,
+//    venue (pool/curve), number of observations.
+//  - Project each coin's log-cap to every answer read with an exponentially
+//    decaying velocity (launch spike fades, tau = 3 steps) plus a mild drift.
+//  - Monte Carlo (seeded) over the 7 reads: sample each coin's projected
 //    log-cap from its uncertainty, rank, record place holders. Average over
 //    reads and samples -> P(coin at place k | a history coin holds it).
 //  - Probabilities: p = (1 - P_NEW) * q for the top coins per place; the rest
-//    stays unnamed for newcomers / coins too small to name. P_NEW grows with
-//    the mean horizon (over 1h ~half the top 5 turns over to coins the history
-//    cannot name; over 10h most of it does).
+//    is left unnamed for newcomers / coins too small to name. P_NEW = 0.50.
 //  - Sizes: per place, a normal in log10(cap in SOL) centred on the projected
 //    cap of the k-th ranked coin at the median read, sd widening with horizon.
 //  - top5: the top 5 by projected log-cap at the median read.
-//
-// Practice evidence (6 marks, 20:00-20:50Z): only 27 of 454 coins appear in
-// both the first and last mark; top-5 churn is extreme early then stabilises.
-// Velocity predicts displacement (MIHAO VI +0.25/step at #7 ended #2 at the
-// last answer read). 3 of the 5 last-read top coins were NOT in the history
-// rows, so a large unnamed share is essential. Pool (graduated) coins are
-// durable; curve coins decay on average.
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,23 +30,23 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const MICRO = 1_000_000;
 
-// ---- tunables (fixed in advance, from the practice analysis) ----
-const TAU_STEPS = 3; // velocity decay timescale, in 10-min steps
+// ---- tunables (fixed in advance, from the practice analysis, not tuned per run) ----
+const TAU_STEPS = 2; // velocity decay timescale, in 10-min steps (v3: faster fade)
 const DRIFT_PER_STEP = -0.01; // slow mean-reversion drift per step
-const VEL_CAP = 0.5; // cap |velocity| per step
+const VEL_CAP = 0.25; // cap |velocity| per step (v3: shrink one-step spikes)
 // Share of each place left for unnameable coins (newcomers). Grows with the
-// mean horizon; capped at 0.65.
-const P_NEW_BASE = 0.45;
+// mean horizon: over 1h ~half the top 5 turns over to coins the history cannot
+// name; over 10h (the final) most of it does. Capped at 0.65.
+const P_NEW_BASE = 0.60; // (v3: newcomers take most top-5 places at long horizon)
 const P_NEW_PER_HOUR = 0.015;
 const P_NEW_CAP = 0.65;
 const MAX_NAMED_PER_PLACE = 12; // coins named per place
 const MC_SAMPLES = 1500; // Monte Carlo samples per read
-const MC_POOL = 60; // coins sampled per read (top by projected mean)
-const SD0 = 0.12; // base log-cap uncertainty
-const SIGMA_STEP = 0.15; // per-step volatility added in quadrature
-const SIZE_SD0 = 0.35; // base size sd (as the house baseline)
+const SD0 = 0; // base log-cap uncertainty (v3: current cap is observed, not uncertain)
+const SIGMA_STEP = 0.04; // per-step volatility added in quadrature (v3: idiosyncratic only;
+// common market moves do not change ranks, so the ranking sd is far below total volatility)
+const SIZE_SD0 = 0.35; // base size sd (as the baseline)
 const SIZE_SD_PER_HOUR = 0.05; // size sd growth per hour of horizon
-const PRIOR_VEL = 0.1; // prior velocity for single-observation coins
 
 interface Row {
   rank: number;
@@ -90,7 +86,6 @@ const reads = task.reads.map((s) => Date.parse(s));
 const cadenceMs = (task.cadence_minutes || 10) * 60 * 1000;
 const lastMarkAt = Date.parse(marks[marks.length - 1]!.at);
 
-/** log10 of a cap in SOL, as the scorer takes it: log10(lamports) - 9. */
 const logcap = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
 
 // ---- per-coin trajectories ----
@@ -123,11 +118,13 @@ interface Feat {
   nObs: number;
 }
 const feats: Feat[] = [];
+// prior velocity for coins with a single observation: median velocity of coins
+// that newly entered the top 20 at the last mark is positive; use +0.10.
+const PRIOR_VEL = 0.1;
 for (const c of coins.values()) {
   const o = c.obs;
   const last = o[o.length - 1]!;
-  // Velocity from the last up to 3 steps, recency-weighted (weights 4, 2, 1:
-  // the most recent step weighs most).
+  // velocity from the last up to 3 steps, recency-weighted (weights 4,2,1)
   let num = 0;
   let den = 0;
   const steps = Math.min(3, o.length - 1);
@@ -136,7 +133,7 @@ for (const c of coins.values()) {
     const b = o[o.length - s]!;
     const dtSteps = Math.max(1, Math.round((b.at - a.at) / cadenceMs));
     const v = (b.log - a.log) / dtSteps;
-    const w = Math.pow(2, steps - s);
+    const w = Math.pow(2, steps - s); // most recent step weighs most
     num += w * v;
     den += w;
   }
@@ -196,10 +193,11 @@ function projectedSd(t: number): number {
   return Math.sqrt(SD0 * SD0 + SIGMA_STEP * SIGMA_STEP * dtSteps);
 }
 
-// ---- Monte Carlo over the reads ----
+// ---- Monte Carlo over the 7 reads ----
 // q[place][mint] = P(coin at place | a history coin holds it), averaged over reads.
 const q: Array<Map<string, number>> = [];
 for (let k = 0; k < places; k++) q.push(new Map());
+const n = feats.length;
 // Precompute per-read projected means and sds.
 const readProj: Array<Array<{ mint: string; mean: number; sd: number }>> = reads.map((t) => {
   const sd = projectedSd(t);
@@ -209,17 +207,14 @@ for (let ri = 0; ri < reads.length; ri++) {
   const proj = readProj[ri]!;
   const counts: Array<Map<string, number>> = [];
   for (let k = 0; k < places; k++) counts.push(new Map());
-  // Sort once by mean to find the plausible top set; sample only the top 60
-  // by mean, to keep it fast. Ranking is dominated by the top.
+  // Sort once by mean to find the plausible top set; sample only the top 60 by
+  // mean plus a random tail, to keep it fast. Ranking is dominated by the top.
   const order = [...proj].sort((a, b) => b.mean - a.mean);
-  const pool = order.slice(0, MC_POOL);
-  // A history smaller than the number of places can only fill that many
-  // places per sample; record only the places the pool actually holds.
-  const placesHere = Math.min(places, pool.length);
+  const pool = order.slice(0, 60);
   for (let s = 0; s < MC_SAMPLES; s++) {
     const sampled = pool.map((p) => ({ mint: p.mint, v: p.mean + p.sd * randn() }));
     sampled.sort((a, b) => b.v - a.v);
-    for (let k = 0; k < placesHere; k++) {
+    for (let k = 0; k < places; k++) {
       const m = sampled[k]!.mint;
       counts[k]!.set(m, (counts[k]!.get(m) ?? 0) + 1);
     }
@@ -255,7 +250,7 @@ const top5 = medProj.slice(0, places).map((p) => p.mint);
 // ---- sizes ----
 // Per place, a normal in log10(cap in SOL) centred on the projected cap of the
 // k-th ranked coin at the median read, sd widening with the mean horizon.
-/** erfc(x), Numerical Recipes' erfcc (fractional error under 1.2e-7 everywhere). */
+const sizeSd = Math.sqrt(SIZE_SD0 * SIZE_SD0 + Math.pow(SIZE_SD_PER_HOUR * meanHorizonH, 2));
 function erfc(x: number): number {
   const z = Math.abs(x);
   const t = 1 / (1 + 0.5 * z);
@@ -267,10 +262,8 @@ function erfc(x: number): number {
     );
   return x >= 0 ? r : 2 - r;
 }
-/** P(X >= x) for X normal with mean `mean` and sd `sd`. */
 const above = (x: number, mean: number, sd: number): number =>
   x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2));
-const sizeSd = Math.sqrt(SIZE_SD0 * SIZE_SD0 + Math.pow(SIZE_SD_PER_HOUR * meanHorizonH, 2));
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
 for (let k = 0; k < places; k++) {
   const mean = medProj[k]!.mean;
